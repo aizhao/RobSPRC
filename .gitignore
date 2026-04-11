@@ -1,0 +1,47 @@
+# 数据集目录（完全忽略）
+cirr_dataset/
+fashioniq/
+dataset/
+data/
+datasets/
+
+# 模型权重、训练输出（完全忽略）
+models/
+saved_models/
+checkpoints/
+weights/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# 日志、输出、缓存
+logs/
+*.log
+*.csv
+*.json
+runs/
+output/
+results/
+tmp/
+temp/
+
+# 系统垃圾
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+.idea/
+.vscode/
+
+# 训练中间文件
+validation_metrics.csv
+train_metrics.csv
+training_hyperparameters.json
+
+# OpenClaw / 本地配置
+.openclaw/
+.claude/

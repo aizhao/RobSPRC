@@ -1,5 +1,5 @@
-# from comet_ml import Experiment
 import json
+import argparse
 from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
@@ -17,47 +17,103 @@ from torch.optim.lr_scheduler import OneCycleLR
 import os
 
 from data_utils import base_path, squarepad_transform, targetpad_transform, CIRRDataset, FashionIQDataset
-from utils import collate_fn, update_train_running_results,update_train_running_results_dict, set_train_bar_description_dict,set_train_bar_description, extract_index_blip_features, \
-    save_model, generate_randomized_fiq_caption, element_wise_sum, device
-from validate_blip import compute_cirr_val_metrics, compute_fiq_val_metrics
+from utils import collate_fn,set_train_bar_description_dict,  update_train_running_results_dict, \
+     extract_index_blip_features, \
+    save_model, generate_randomized_fiq_caption, device
+from validate_blip import (
+    compute_cirr_val_metrics,
+    compute_fiq_val_metrics,
+    analyze_cirr_kappa_behavior,
+)
 
+class ModelEMA:
+    """
+    轻量级 EMA (Exponential Moving Average)
+    专为冻结了大部分底座（如 ViT）的大模型设计，仅对可训练参数进行滑动平均。
+    """
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {}  # 存放平滑后的权重
+        self.backup = {}  # 评估时临时存放当前权重
+
+        # 初始化时，只把需要梯度的参数拉出来做 EMA，极大节省显存
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone().detach()
+
+    @torch.no_grad()
+    def update(self, model):
+        """在每次 optimizer.step() 后调用此方法更新影子权重"""
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                # 公式: shadow = decay * shadow + (1 - decay) * param
+                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_shadow(self, model):
+        """在验证 (Validation) 开始前调用，将平滑权重注入模型"""
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model):
+        """在验证结束后调用，恢复模型的当前训练权重"""
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param.data.copy_(self.backup[name])
+        self.backup.clear()
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
 def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
                       num_epochs: int, blip_model_name: str, backbone: str, learning_rate: float, batch_size: int,
-                      validation_frequency: int, transform: str, save_training: bool, save_best: bool, save_memory: bool, 
-                      **kwargs):
+                      validation_frequency: int, transform: str, save_training: bool, save_best: bool, save_memory: bool,
+                      warmup_epochs: int, use_cache: bool, 
+                      use_validity_scorer: bool, hard_negative_mining: bool, use_delta_constraint: bool, **kwargs):
     """
-    Fine-tune CLIP on the FashionIQ dataset using as combining function the image-text element-wise sum
-    :param train_dress_types: FashionIQ categories to train on
-    :param val_dress_types: FashionIQ categories to validate on
-    :param num_epochs: number of epochs
-    :param clip_model_name: CLIP model you want to use: "RN50", "RN101", "RN50x4"...
-    :param learning_rate: fine-tuning leanring rate
-    :param batch_size: batch size
-    :param validation_frequency: validation frequency expressed in epoch
-    :param transform: preprocess transform you want to use. Should be in ['clip', 'squarepad', 'targetpad']. When
-                targetpad is also required to provide `target_ratio` kwarg.
-    :param save_training: when True save the weights of the fine-tuned CLIP model
-    :param encoder: which CLIP encoder to fine-tune, should be in ['both', 'text', 'image']
-    :param save_best: when True save only the weights of the best CLIP model wrt the average_recall metric
-    :param kwargs: if you use the `targetpad` transform you should prove `target_ratio` as kwarg
+    Fine-tune on FashionIQ dataset with Uncertainty (MUS/TAS) & Precomputed Features support
     """
-
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     training_path: Path = Path(
         base_path / f"models/clip_finetuned_on_fiq_{blip_model_name}_{training_start}")
     training_path.mkdir(exist_ok=False, parents=True)
     print(f"save-memory-in: {save_memory}")
-    # Save all the hyperparameters on a file
+    
+    # Save parameters
     with open(training_path / "training_hyperparameters.json", 'w+') as file:
-        json.dump(training_hyper_params, file, sort_keys=True, indent=4)
+        json.dump(kwargs, file, sort_keys=True, indent=4)
+
     blip_model, vis_processors, txt_processors = load_model_and_preprocess(name=blip_model_name, model_type=backbone, is_eval=False, device=device)
+    
+    # 🚀 拦截并覆写消融开关！
+    blip_model.use_validity_scorer = use_validity_scorer
+    blip_model.hard_negative_mining = hard_negative_mining
+    blip_model.use_delta_constraint = use_delta_constraint
+
+    print("="*50)
+    print(f"🎛️ FIQ Training Ablation Config Applied:")
+    print(f"  Validity Scorer (Soft Gating) : {blip_model.use_validity_scorer}")
+    print(f"  Hard Negative Mining          : {blip_model.hard_negative_mining}")
+    print(f"  Delta Constraint (L_delta)    : {blip_model.use_delta_constraint}")
+    print("="*50)
+
+    # Update Q-Former if needed
     update_method = getattr(blip_model, '_update_f_former', None)
     if callable(update_method):
         blip_model._update_f_former()
 
     input_dim = 224
-
     if transform == "squarepad":
         preprocess = squarepad_transform(input_dim)
         print('Square pad preprocess pipeline is used')
@@ -72,70 +128,86 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
     relative_val_datasets = []
     classic_val_datasets = []
 
-    # Define the validation datasets
+    # Validation Datasets (Standard Image Loading)
     for idx, dress_type in enumerate(val_dress_types):
         idx_to_dress_mapping[idx] = dress_type
-        relative_val_dataset = FashionIQDataset('val', [dress_type], 'relative', preprocess, )
+        relative_val_dataset = FashionIQDataset('val', [dress_type], 'relative', preprocess)
         relative_val_datasets.append(relative_val_dataset)
-        classic_val_dataset = FashionIQDataset('val', [dress_type], 'classic', preprocess, )
+        classic_val_dataset = FashionIQDataset('val', [dress_type], 'classic', preprocess)
         classic_val_datasets.append(classic_val_dataset)
 
-    # Define the train datasets and the combining function
-    relative_train_dataset = FashionIQDataset('train', train_dress_types, 'relative', preprocess)
+    # Train Dataset (Supports Precomputed Features)
+    relative_train_dataset = FashionIQDataset('train', train_dress_types, 'relative', preprocess, use_cache=use_cache)
+    
     relative_train_loader = DataLoader(dataset=relative_train_dataset, batch_size=batch_size,
                                        num_workers=kwargs['num_workers'], pin_memory=False, collate_fn=collate_fn,
                                        drop_last=True, shuffle=True)
 
-    # Define the optimizer, the loss and the grad scaler
-    optimizer = optim.AdamW(
-        [{'params': filter(lambda p: p.requires_grad, blip_model.parameters()), 'lr': learning_rate,
-        #   'betas': (0.9, 0.999), 'eps': 1e-7, 'weight_decay':0.05}])
-        'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay':0.05}])
-    # scheduler = OneCycleLR(optimizer, max_lr=learning_rate, pct_start=1/50, steps_per_epoch=len(relative_train_loader), epochs=80)
-    scheduler = OneCycleLR(optimizer, max_lr=learning_rate, pct_start=1.5/num_epochs, div_factor=100., steps_per_epoch=len(relative_train_loader), epochs=num_epochs)
+    # ==========================================================
+    # 🚀 核心修复：差异化学习率 (Multi-LR for Sigmoid Loss)
+    # ==========================================================
+    backbone_params = []
+    loss_params = []
+    for name, p in blip_model.named_parameters():
+        if p.requires_grad:
+            if 'hug_loss_fn' in name:
+                loss_params.append(p)
+                print(f"🔥 [LR 提速特权分配 - FIQ] 损失函数参数: {name}")
+            else:
+                backbone_params.append(p)
+
+    optimizer = optim.AdamW([
+        {'params': backbone_params, 'lr': learning_rate, 'betas': (0.9, 0.98), 'eps': 1e-8, 'weight_decay': 0.05},
+        {'params': loss_params, 'lr': 1e-3, 'betas': (0.9, 0.98), 'eps': 1e-8, 'weight_decay': 0.0} # 🌟 Sigmoid 边界专属法拉利起步
+    ])
+    
+    # 🌟 修复 OneCycleLR 多组参数覆盖问题：必须传入一个对应长度的 list
+    scheduler = OneCycleLR(optimizer, max_lr=[learning_rate, 1e-3], pct_start=1.5 / num_epochs, div_factor=100.,
+                           steps_per_epoch=len(relative_train_loader), epochs=num_epochs)
 
     scaler = torch.cuda.amp.GradScaler()
 
-    # When save_best == True initialize the best result to zero
     if save_best:
         best_avg_recall = 0
 
-    # Define dataframes for CSV logging
     training_log_frame = pd.DataFrame()
     validation_log_frame = pd.DataFrame()
 
-
-    # Start with the training loop
     print('Training loop started')
     for epoch in range(num_epochs):
+        enable_uncertainty = (epoch >= warmup_epochs)
+        stage_name = "Uncertainty" if enable_uncertainty else "Warm-up"
+        
         train_running_results = {'images_in_epoch': 0}
+        print(f"\nEpoch {epoch+1}/{num_epochs} - Stage: {stage_name}")
+        
         train_bar = tqdm(relative_train_loader, ncols=150)
         for idx, (reference_images, target_images, captions) in enumerate(train_bar):
             images_in_batch = reference_images.size(0)
-            step = len(train_bar) * epoch + idx
-
+            
             optimizer.zero_grad()
 
             reference_images = reference_images.to(device, non_blocking=True)
             target_images = target_images.to(device, non_blocking=True)
 
-            # Randomize the training caption in four way: (a) cap1 and cap2 (b) cap2 and cap1 (c) cap1 (d) cap2
             flattened_captions: list = np.array(captions).T.flatten().tolist()
             captions = generate_randomized_fiq_caption(flattened_captions)
             captions = [txt_processors["eval"](caption) for caption in captions]
+            
             blip_model.train()
-            # Extract the features, compute the logits and the loss
-            with torch.cuda.amp.autocast():
-                loss_dict = blip_model({"image":reference_images, "target":target_images, "text_input":captions})
-                loss = 0.
-                for key in loss_dict.keys():
-                    loss += loss_dict[key]
+            
+            with torch.amp.autocast('cuda'):
+                loss_dict = blip_model(
+                    {"image": reference_images, "target": target_images, "text_input": captions, "epoch": epoch},
+                    enable_uncertainty=enable_uncertainty
+                )
+                loss = loss_dict['loss']
 
-            # Backpropagate and update the weights
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
+            
             update_train_running_results_dict(train_running_results, loss_dict, images_in_batch)
             set_train_bar_description_dict(train_bar, epoch, num_epochs, train_running_results)
 
@@ -143,11 +215,9 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
         for key in train_running_results.keys():
             if key != 'images_in_epoch':
                 loss_log_dict[key] = float(
-            train_running_results[key] / train_running_results['images_in_epoch'])
-            # Training CSV logging
-        training_log_frame = pd.concat(
-            [training_log_frame,
-                pd.DataFrame(data=loss_log_dict, index=[0])])
+                    train_running_results[key] / train_running_results['images_in_epoch'])
+        
+        training_log_frame = pd.concat([training_log_frame, pd.DataFrame(data=loss_log_dict, index=[0])])
         training_log_frame.to_csv(str(training_path / 'train_metrics.csv'), index=False)
 
         if epoch % validation_frequency == 0:
@@ -155,15 +225,13 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
             recalls_at10 = []
             recalls_at50 = []
 
-            # Compute and log validation metrics for each validation dataset (which corresponds to a different
-            # FashionIQ category)
             for relative_val_dataset, classic_val_dataset, idx in zip(relative_val_datasets, classic_val_datasets,
-                                                                        idx_to_dress_mapping):
-             
+                                                                      idx_to_dress_mapping):
                 index_features, index_names = extract_index_blip_features(classic_val_dataset, blip_model, save_memory)
                 recall_at10, recall_at50 = compute_fiq_val_metrics(relative_val_dataset, blip_model,
-                                                                    index_features, index_names, txt_processors, save_memory)
-                
+                                                                   index_features, index_names, txt_processors,
+                                                                   save_memory)
+
                 recalls_at10.append(recall_at10)
                 recalls_at50.append(recall_at50)
                 torch.cuda.empty_cache()
@@ -179,8 +247,7 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
             })
 
             print(json.dumps(results_dict, indent=4))
-          
-            # Validation CSV logging
+
             log_dict = {'epoch': epoch}
             log_dict.update(results_dict)
             validation_log_frame = pd.concat([validation_log_frame, pd.DataFrame(data=log_dict, index=[0])])
@@ -192,44 +259,44 @@ def clip_finetune_fiq(train_dress_types: List[str], val_dress_types: List[str],
                     save_model('tuned_clip_best', epoch, blip_model, training_path)
 
 
-
 def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, learning_rate: float, batch_size: int,
                        validation_frequency: int, transform: str, save_training: bool, save_best: bool,
-                       **kwargs):
+                       warmup_epochs: int, use_cache: bool, 
+                       use_validity_scorer: bool, hard_negative_mining: bool, use_delta_constraint: bool, **kwargs):
     """
-    Fine-tune CLIP on the CIRR dataset using as combining function the image-text element-wise sum
-    :param num_epochs: number of epochs
-    :param blip_model_name: BLIP model you want to use: "RN50", "RN101", "RN50x4"...
-    :param learning_rate: fine-tuning learning rate
-    :param batch_size: batch size
-    :param validation_frequency: validation frequency expressed in epoch
-    :param transform: preprocess transform you want to use. Should be in ['clip', 'squarepad', 'targetpad']. When
-                targetpad is also required to provide `target_ratio` kwarg.
-    :param save_training: when True save the weights of the Combiner network
-    :param encoder: which CLIP encoder to fine-tune, should be in ['both', 'text', 'image']
-    :param save_best: when True save only the weights of the best Combiner wrt three different averages of the metrics
-    :param kwargs: if you use the `targetpad` transform you should prove `target_ratio`    :return:
+    Fine-tune on CIRR dataset with Uncertainty (MUS/TAS) & Precomputed Features support
     """
-    rtc_weights = kwargs['loss_rtc']
-    align_weights = kwargs['loss_align']
     training_start = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+    
+    # 将消融配置加入文件夹名称中，方便区分不同的实验
+    ablation_suffix = f"vs{int(use_validity_scorer)}_hn{int(hard_negative_mining)}_dc{int(use_delta_constraint)}"
     training_path: Path = Path(
-        base_path / f"models/clip_finetuned_on_cirr_{blip_model_name}_{training_start}")
+        base_path / f"models/clip_finetuned_on_cirr_{blip_model_name}_{ablation_suffix}_{training_start}")
     training_path.mkdir(exist_ok=False, parents=True)
 
-    # Save all the hyperparameters on a file
     with open(training_path / "training_hyperparameters.json", 'w+') as file:
-        json.dump(training_hyper_params, file, sort_keys=True, indent=4)
+        json.dump(kwargs, file, sort_keys=True, indent=4)
 
-    # clip_model, clip_preprocess = clip.load(clip_model_name, device=device, jit=False)
-    blip_model, vis_processors, txt_processors = load_model_and_preprocess(name=blip_model_name, model_type=backbone, is_eval=False, device=device)
+    blip_model, vis_processors, txt_processors = load_model_and_preprocess(name=blip_model_name, model_type=backbone,
+                                                                           is_eval=False, device=device)
+    
+    # 🚀 拦截并覆写消融开关！
+    blip_model.use_validity_scorer = use_validity_scorer
+    blip_model.hard_negative_mining = hard_negative_mining
+    blip_model.use_delta_constraint = use_delta_constraint
+
+    print("="*50)
+    print(f"🎛️ CIRR Training Ablation Config Applied:")
+    print(f"  Validity Scorer (Soft Gating) : {blip_model.use_validity_scorer}")
+    print(f"  Hard Negative Mining          : {blip_model.hard_negative_mining}")
+    print(f"  Delta Constraint (L_delta)    : {blip_model.use_delta_constraint}")
+    print("="*50)
+
     update_method = getattr(blip_model, '_update_f_former', None)
     if callable(update_method):
         blip_model._update_f_former()
 
-    # clip_model.eval().float()
     input_dim = 224
-
     if transform == "squarepad":
         preprocess = squarepad_transform(input_dim)
         print('Square pad preprocess pipeline is used')
@@ -240,91 +307,108 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
     else:
         raise ValueError("Preprocess transform should be in ['clip', 'squarepad', 'targetpad']")
 
-    # Define the validation datasets
     relative_val_dataset = CIRRDataset('val', 'relative', preprocess)
     classic_val_dataset = CIRRDataset('val', 'classic', preprocess)
 
-    # When fine-tuning only the text encoder we can precompute the index features since they do not change over
-    # the epochs
-
-    # Define the train dataset and the combining function
-    relative_train_dataset = CIRRDataset('train', 'relative', preprocess)
+    relative_train_dataset = CIRRDataset('train', 'relative', preprocess, use_cache=use_cache)
+    
     relative_train_loader = DataLoader(dataset=relative_train_dataset, batch_size=batch_size,
                                        num_workers=kwargs['num_workers'], pin_memory=False, collate_fn=collate_fn,
                                        drop_last=True, shuffle=True)
 
-    # Define the optimizer, the loss and the grad scaler
-    optimizer = optim.AdamW(
-        [{'params': filter(lambda p: p.requires_grad, blip_model.parameters()), 'lr': learning_rate,
-          'betas': (0.9, 0.98), 'eps': 1e-7, 'weight_decay':0.05}])
-    scheduler = OneCycleLR(optimizer, max_lr=learning_rate, pct_start=1/50, steps_per_epoch=len(relative_train_loader), epochs=80)
+    # ==========================================================
+    # 🚀 核心修复：差异化学习率 (Multi-LR for Sigmoid Loss)
+    # ==========================================================
+    backbone_params = []
+    loss_params = []
+    for name, p in blip_model.named_parameters():
+        if p.requires_grad:
+            if 'hug_loss_fn' in name:
+                loss_params.append(p)
+                print(f"🔥 [LR 提速特权分配 - CIRR] 损失函数参数: {name}")
+            else:
+                backbone_params.append(p)
+
+    optimizer = optim.AdamW([
+        {'params': backbone_params, 'lr': learning_rate, 'betas': (0.9, 0.98), 'eps': 1e-8, 'weight_decay': 0.05},
+        {'params': loss_params, 'lr': 1e-3, 'betas': (0.9, 0.98), 'eps': 1e-8, 'weight_decay': 0.0} # 🌟 Sigmoid 边界专属法拉利起步
+    ])
+    
+    # 🌟 修复 OneCycleLR 多组参数覆盖问题：必须传入一个对应长度的 list
+    # 之前写死了 epochs=80，现在改成动态的 num_epochs
+    scheduler = OneCycleLR(optimizer, max_lr=[learning_rate, 1e-3], pct_start=1.5 / num_epochs,
+                           steps_per_epoch=len(relative_train_loader), epochs=num_epochs)
 
     scaler = torch.cuda.amp.GradScaler()
 
-    # When save_best == True initialize the best results to zero
+    # ema = ModelEMA(blip_model, decay=0.999)
     if save_best:
         best_harmonic = 0
         best_geometric = 0
         best_arithmetic = 0
 
-    # Define dataframes for CSV logging
     training_log_frame = pd.DataFrame()
     validation_log_frame = pd.DataFrame()
-    # debug 1 
-    # val_index_features, val_index_names = extract_index_blip_features(classic_val_dataset, blip_model)
-    # # 
-    # results = compute_cirr_val_metrics(relative_val_dataset, blip_model, val_index_features,
-    #                                     val_index_names, txt_processors)
+
     for epoch in range(num_epochs):
+        enable_uncertainty = (epoch >= warmup_epochs)
+        stage_name = "Uncertainty" if enable_uncertainty else "Warm-up"
+        
         train_running_results = {'images_in_epoch': 0}
+        print(f"\nEpoch {epoch+1}/{num_epochs} - Stage: {stage_name}")
+        
         train_bar = tqdm(relative_train_loader, ncols=150)
         for idx, (reference_images, target_images, captions) in enumerate(train_bar):
-            # print(scheduler.optimizer.param_groups[0]['lr'])
             images_in_batch = reference_images.size(0)
-            step = len(train_bar) * epoch + idx
+            
             optimizer.zero_grad()
 
             reference_images = reference_images.to(device, non_blocking=True)
             target_images = target_images.to(device, non_blocking=True)
             captions = [txt_processors["eval"](caption) for caption in captions]
+            
             blip_model.train()
-            # Extract the features, compute the logits and the loss
-            with torch.cuda.amp.autocast():
-                loss_dict = blip_model({"image":reference_images, "target":target_images, "text_input":captions})
-                loss = 0.
-                for key in loss_dict.keys():
-                    if key != 'loss_itc':
-                        loss += kwargs[key] * loss_dict[key]
-                    else:
-                        loss += loss_dict[key]
-            # Backpropagate and update the weights
+            
+            with torch.amp.autocast('cuda'):
+                loss_dict = blip_model(
+                    {"image": reference_images, "target": target_images, "text_input": captions, "epoch": epoch},
+                    enable_uncertainty=enable_uncertainty
+                )
+                loss = loss_dict['loss']
+            
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
-
+            # ema.update(blip_model)
             update_train_running_results_dict(train_running_results, loss_dict, images_in_batch)
             set_train_bar_description_dict(train_bar, epoch, num_epochs, train_running_results)
-
 
         loss_log_dict = {'epoch': epoch}
         for key in train_running_results.keys():
             if key != 'images_in_epoch':
                 loss_log_dict[key] = float(
-            train_running_results[key] / train_running_results['images_in_epoch'])
-            # Training CSV logging
-        training_log_frame = pd.concat(
-            [training_log_frame,
-                pd.DataFrame(data=loss_log_dict, index=[0])])
+                    train_running_results[key] / train_running_results['images_in_epoch'])
+        
+        training_log_frame = pd.concat([training_log_frame, pd.DataFrame(data=loss_log_dict, index=[0])])
         training_log_frame.to_csv(str(training_path / 'train_metrics.csv'), index=False)
 
         if epoch % validation_frequency == 0:
             blip_model.eval()
-                # extract target image features
-            val_index_features, val_index_names = extract_index_blip_features(classic_val_dataset, blip_model)
-            # 
-            results = compute_cirr_val_metrics(relative_val_dataset, blip_model, val_index_features,
-                                                val_index_names, txt_processors)
+
+            val_index_features, val_index_kappas, val_index_names = extract_index_blip_features(
+                classic_val_dataset, blip_model
+            )
+
+            # 1) 原有 CIRR 检索指标
+            results = compute_cirr_val_metrics(
+                relative_val_dataset,
+                blip_model,
+                val_index_features,
+                val_index_names,
+                txt_processors,
+                val_index_kappas=val_index_kappas
+            )
             group_recall_at1, group_recall_at2, group_recall_at3, recall_at1, recall_at5, recall_at10, recall_at50 = results
 
             results_dict = {
@@ -340,28 +424,42 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
                 'harmonic_mean': harmonic_mean(results),
                 'geometric_mean': geometric_mean(results)
             }
-            print(json.dumps(results_dict, indent=4))
-            # Validation CSV logging
+
+            # 2) 新增：kappa 行为分析
+            kappa_analysis = analyze_cirr_kappa_behavior(
+                blip_model=blip_model,
+                relative_val_dataset=relative_val_dataset,
+                index_names=val_index_names,
+                index_features=val_index_features,
+                txt_processors=txt_processors,
+                val_index_kappas=val_index_kappas,
+            )
+
+            print(json.dumps(results_dict, indent=4, ensure_ascii=False))
+            print(json.dumps(kappa_analysis, indent=4, ensure_ascii=False))
+
+            # 3) 一起写入日志
             log_dict = {'epoch': epoch}
             log_dict.update(results_dict)
-            validation_log_frame = pd.concat([validation_log_frame, pd.DataFrame(data=log_dict, index=[0])])
+            log_dict.update(kappa_analysis)
+
+            validation_log_frame = pd.concat(
+                [validation_log_frame, pd.DataFrame(data=log_dict, index=[0])]
+            )
             validation_log_frame.to_csv(str(training_path / 'validation_metrics.csv'), index=False)
 
-            # if save_training and epoch > 18:
             if save_training:
                 if save_best and results_dict['arithmetic_mean'] > best_arithmetic:
                     best_arithmetic = results_dict['arithmetic_mean']
                     save_model('tuned_clip_arithmetic', epoch, blip_model, training_path)
-
+            # ema.restore(blip_model)
 
 def set_seed(seed: int = 42) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    # When running on the CuDNN backend, two further options must be set
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    # Set a fixed value for the hash seed
     os.environ["PYTHONHASHSEED"] = str(seed)
     print(f"Random seed set as {seed}")
 
@@ -373,13 +471,13 @@ if __name__ == '__main__':
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--num-epochs", default=300, type=int, help="number training epochs")
     parser.add_argument("--blip-model-name", default="blip2_cir_cat", type=str, help="[blip2_cir_cat, blip2_cir]")
-    parser.add_argument("--backbone", type=str, default="pretrain", help="pretrain for vit-g, pretrain_vitL for vit-l")
+    parser.add_argument("--backbone", type=str, default="pretrain",
+                        help="pretrain for vit-g, pretrain_vitL for vit-l")
     parser.add_argument("--learning-rate", default=2e-6, type=float, help="Learning rate")
     parser.add_argument("--batch-size", default=512, type=int, help="Batch size")
-    parser.add_argument("--loss-align", default=0.4, type=float)
-    parser.add_argument("--loss-rtc", default=0.4, type=float)
-    parser.add_argument("--loss-itm", default=1, type=float)
-    parser.add_argument("--validation-frequency", default=1, type=int, help="Validation frequency expressed in epochs")
+    
+    parser.add_argument("--validation-frequency", default=1, type=int,
+                        help="Validation frequency expressed in epochs")
     parser.add_argument("--target-ratio", default=1.25, type=float, help="TargetPad target ratio")
     parser.add_argument("--transform", default="targetpad", type=str,
                         help="Preprocess pipeline, should be in ['clip', 'squarepad', 'targetpad'] ")
@@ -389,11 +487,22 @@ if __name__ == '__main__':
                         help="Save only the best model during training")
     parser.add_argument("--save-memory", dest="save_memory", action='store_true',
                         help="Save only the best model during training")
+    
+    parser.add_argument("--warmup-epochs", default=5, type=int, 
+                        help="Number of epochs to disable uncertainty loss (Warm-up)")
+    parser.add_argument("--use-cache", action='store_true', 
+                        help="Use precomputed ViT features for training (Extreme Speedup)")
+
+    # 🎛️ 注册消融实验命令行参数 (默认全部开启)
+    parser.add_argument("--use-validity-scorer", type=str2bool, default=True, help="启用错配验证器")
+    parser.add_argument("--hard-negative-mining", type=str2bool, default=True, help="启用困难负样本")
+    parser.add_argument("--use-delta-constraint", type=str2bool, default=True, help="启用差分损失")
 
     args = parser.parse_args()
     if args.dataset.lower() not in ['fashioniq', 'cirr']:
         raise ValueError("Dataset should be either 'CIRR' or 'FashionIQ")
     print(f"save-memory: {args.save_memory}")
+    
     training_hyper_params = {
         "num_epochs": args.num_epochs,
         "num_workers": args.num_workers,
@@ -407,11 +516,15 @@ if __name__ == '__main__':
         "save_training": args.save_training,
         "save_best": args.save_best,
         "data_path": args.data_path,
-        "loss_rtc": args.loss_rtc,
-        "loss_align": args.loss_align,
-        "loss_itm": args.loss_itm,
-        "save_memory": args.save_memory
+        "save_memory": args.save_memory,
+        "warmup_epochs": args.warmup_epochs,
+        "use_cache": args.use_cache,
+        # 传入消融参数
+        "use_validity_scorer": args.use_validity_scorer,
+        "hard_negative_mining": args.hard_negative_mining,
+        "use_delta_constraint": args.use_delta_constraint
     }
+    
     # set_seed(912)
     if args.dataset.lower() == 'cirr':
         clip_finetune_cirr(**training_hyper_params)
@@ -419,5 +532,3 @@ if __name__ == '__main__':
         training_hyper_params.update(
             {'train_dress_types': ['dress', 'toptee', 'shirt'], 'val_dress_types': ['dress', 'toptee', 'shirt']})
         clip_finetune_fiq(**training_hyper_params)
-
-
