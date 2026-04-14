@@ -3,20 +3,23 @@
  All rights reserved.
  SPDX-License-Identifier: BSD-3-Clause
 
- 原始修改版：
- 1. 保留你已验证有效的新 query 构造：top-k 局部选择 + 差异门控更新 + composer
- 2. target 改为 32 个 token 表示，query-vs-target-token 取 max 做匹配
- 3. 主损失保持 InfoNCE 主线（并保留轻量 hard negative 辅助）
- 4. 其余 query / kappa / 动态融合 / loss_kappa / loss_cord 逻辑不变
- 5. 推理保持纯 cosine，支持 target 多 token 输入时 token 维取 max
+ 32-token CIR + stabilized kappa-energy metric
+ 主要修改：
+ 1. 保留局部选择 + 差异门控更新 + composer
+ 2. Query / Target 均采用 32 token dense representation
+ 3. 主匹配分数改为 stabilized mixed score:
+        score = (1-eta)*cos + eta*( beta*kq*kt*cos - 0.5*lam*(kq^2 + kt^2) )
+    其中：
+      - kappa 先缩放再截断
+      - target-side kappa 先 detach，避免噪声拖坏主检索
+ 4. token 聚合仍使用 query token 的 kappa 做加权
+ 5. loss_align 改回 prompt-anchor 语义，但保留 token-level
 """
 
 import logging
 import math
 import numpy as np
-import random
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from torch.cuda.amp import autocast as autocast
 from torch.nn import functional as F
@@ -30,17 +33,18 @@ from lavis.models.blip2_models.blip2 import (
 )
 
 
-# ================= [vMF 核心映射与数学工具模块] =================
+# ================= [基础模块] =================
 
 
 class KappaPredictor(nn.Module):
     """
-    不确定性感知网络：输出 concentration / confidence 标量 kappa
+    输出 concentration / confidence 标量 kappa
+    支持 2D: [B, D]
+    支持 3D: [B, T, D]
     """
     def __init__(self, input_dim, hidden_dim=256, epsilon=1e-4):
         super().__init__()
         self.epsilon = epsilon
-
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
@@ -59,23 +63,28 @@ class KappaPredictor(nn.Module):
         return kappa
 
 
+import math
+
 def log_bessel_i(v, x, terms=50):
     """
-    Compute the logarithm of the modified Bessel function of the first kind, log(I_v(x)),
-    using PyTorch.
+    计算 log(I_v(x))，用于 vMF 的 log-partition 与 A_p(kappa)
+    支持广播输入。
     """
     if not torch.is_tensor(x):
         x = torch.tensor(x, dtype=torch.float32)
     if not torch.is_tensor(v):
-        v = torch.tensor(v, dtype=torch.float32)
+        v = torch.tensor(v, dtype=torch.float32, device=x.device)
 
-    x = x.unsqueeze(-1)
-    k = torch.arange(terms, dtype=torch.float32, device=x.device)
+    x = x.clamp_min(1e-6)
+    x_unsq = x.unsqueeze(-1)
 
-    log_coef = (2 * k + v) * torch.log(x / 2) - (torch.lgamma(k + 1) + torch.lgamma(k + v + 1))
+    k = torch.arange(terms, dtype=x.dtype, device=x.device)
+    log_coef = (2 * k + v) * torch.log(x_unsq / 2.0) - (
+        torch.lgamma(k + 1) + torch.lgamma(k + v + 1)
+    )
 
     max_log_coef = torch.max(log_coef, dim=-1, keepdim=True)[0]
-    sum_exp_log = torch.exp(log_coef - max_log_coef).clamp_max(1e7).sum(dim=-1)
+    sum_exp_log = torch.exp(log_coef - max_log_coef).sum(dim=-1).clamp_min(1e-30)
 
     log_bessel = max_log_coef.squeeze(-1) + torch.log(sum_exp_log)
     return log_bessel
@@ -83,49 +92,136 @@ def log_bessel_i(v, x, terms=50):
 
 def vmf_logpartition(kappa, d):
     """
-    Evaluates the log-partition log C_d(kappa) for vMF density.
-    Inspired from: https://github.com/minyoungkim21/vmf-lib
+    log C_d(kappa)
+    vMF density: f(x; mu, kappa) = C_d(kappa) exp(kappa * mu^T x)
     """
-    s = 0.5 * d - 1
-    logI = log_bessel_i(s, kappa)
-
-    if (logI != logI).sum().item() > 0:
-        raise ValueError('NaN is detected from the output of log-besseli()')
-
-    logC = -0.5 * d * np.log(2 * np.pi) + s * kappa.clamp_min(1e-7).log() - logI
+    kappa = kappa.clamp_min(1e-6)
+    nu = 0.5 * d - 1.0
+    logI = log_bessel_i(nu, kappa)
+    logC = nu * torch.log(kappa) - (0.5 * d) * math.log(2.0 * math.pi) - logI
     return logC
 
 
-class Global_vMF_CIR_Loss(nn.Module):
+def vmf_A(kappa, d):
     """
-    query 单向量 vs target 多 token
-    主损失 = InfoNCE / ITC
-    logits 保留 PML 风格的 loc(kappa) + kappa * sim 形式：
-        logits_ij = ( logC(kappa_i) + kappa_i * sim_ij ) / temp
+    A_d(kappa) = I_{nu+1}(kappa) / I_nu(kappa),  nu = d/2 - 1
+    这是 vMF 的均值收缩因子，E[x] = A_d(kappa) * mu
     """
-    def __init__(self, feature_dim=256, temp_init=0.07):
+    kappa = kappa.clamp_min(1e-6)
+    nu = 0.5 * d - 1.0
+
+    logI_nu = log_bessel_i(nu, kappa)
+    logI_nu1 = log_bessel_i(nu + 1.0, kappa)
+
+    A = torch.exp((logI_nu1 - logI_nu).clamp(min=-60.0, max=0.0))
+    return A.clamp(min=1e-8, max=1.0 - 1e-6)
+
+
+def vmf_entropy(kappa, d):
+    """
+    H(vMF(mu, kappa)) = -log C_d(kappa) - kappa * A_d(kappa)
+    熵只与 kappa 有关，不依赖 mu
+    """
+    kappa = kappa.clamp_min(1e-6)
+    logC = vmf_logpartition(kappa, d)
+    A = vmf_A(kappa, d)
+    H = -logC - kappa * A
+    return H
+
+
+def vmf_kl(kappa_p, mu_dot, kappa_q, d):
+    """
+    KL( vMF(mu_p, kappa_p) || vMF(mu_q, kappa_q) )
+
+    公式：
+    KL = log C(kappa_p) - log C(kappa_q)
+         + A_d(kappa_p) * (kappa_p - kappa_q * <mu_p, mu_q>)
+    """
+    kappa_p = kappa_p.clamp_min(1e-6)
+    kappa_q = kappa_q.clamp_min(1e-6)
+
+    logC_p = vmf_logpartition(kappa_p, d)
+    logC_q = vmf_logpartition(kappa_q, d)
+    A_p = vmf_A(kappa_p, d)
+
+    kl = logC_p - logC_q + A_p * (kappa_p - kappa_q * mu_dot)
+    return kl
+
+
+class TokenWise_vMF_KL_CIR_Loss(nn.Module):
+    """
+    Query 多 Token vs Target 多 Token
+    - token-pair 度量：对称 KL
+    - target token 维：MaxSim (最大负 KL，也就是最小 KL)
+    - query token 聚合：用 vMF 熵做权重
+    """
+    def __init__(self, feature_dim=256, temp_init=0.07, token_weight_temp=0.5):
         super().__init__()
         self.d = feature_dim
         self.temp = nn.Parameter(temp_init * torch.ones([]))
+        self.token_weight_temp = token_weight_temp
 
-    def forward(self, fusion_feats, kappa_q, target_feats):
-        bs = fusion_feats.size(0)
-        labels = torch.arange(bs, device=fusion_feats.device)
+    def forward(self, query_tokens, kappa_q_tokens, target_tokens, kappa_t_tokens):
+        """
+        query_tokens:   [B, T_q, D]
+        kappa_q_tokens: [B, T_q]
+        target_tokens:  [N, T_t, D]
+        kappa_t_tokens: [N, T_t]
+        """
+        bs, T_q, _ = query_tokens.size()
+        labels = torch.arange(bs, device=query_tokens.device)
 
-        sim_t2q = torch.einsum('bd,ntd->bnt', fusion_feats, target_feats)
-        sim_i2t, _ = sim_t2q.max(dim=-1)  # [B, B]
+        # cosine between token pairs
+        # [B, N, T_t, T_q]
+        sim_q2t = torch.einsum('bqd,ntd->bntq', query_tokens, target_tokens)
 
-        if kappa_q.dim() == 1:
-            kappa_q = kappa_q.unsqueeze(-1)
-        kappa_q = kappa_q.clamp_min(1e-6)
-        logC_q = vmf_logpartition(kappa_q, self.d)  # [B, 1]
+        kappa_q_tokens = kappa_q_tokens.clamp_min(1e-6)
+        kappa_t_tokens = kappa_t_tokens.clamp_min(1e-6)
 
-        logits_i2t = (logC_q + kappa_q * sim_i2t) / self.temp.clamp_min(1e-6)
-        loss_itc = F.cross_entropy(logits_i2t, labels)
-        return loss_itc, sim_i2t, logits_i2t
+        kq = kappa_q_tokens.unsqueeze(1).unsqueeze(1)   # [B,1,1,T_q]
+        kt = kappa_t_tokens.unsqueeze(0).unsqueeze(-1)  # [1,N,T_t,1]
+
+        # KL(q || t)
+        kl_q_t = vmf_kl(
+            kappa_p=kq,
+            mu_dot=sim_q2t,
+            kappa_q=kt,
+            d=self.d
+        )
+
+        # KL(t || q)
+        kl_t_q = vmf_kl(
+            kappa_p=kt,
+            mu_dot=sim_q2t,
+            kappa_q=kq,
+            d=self.d
+        )
+
+        # symmetric KL
+        skl_qt = 0.5 * (kl_q_t + kl_t_q)   # [B,N,T_t,T_q]
+
+        # similarity = -KL
+        score_q2t = -skl_qt
+
+        # 对 target token 维取最优匹配
+        max_score_i2t, _ = score_q2t.max(dim=2)   # [B,N,T_q]
+
+        # 用 query token 的熵做权重：低熵(更确定) → 权重大
+        entropy_q = vmf_entropy(kappa_q_tokens, self.d)   # [B,T_q]
+        token_weights = F.softmax(
+            -entropy_q.detach() / self.token_weight_temp, dim=-1
+        )   # [B,T_q]
+
+        score_global = (max_score_i2t * token_weights.unsqueeze(1)).sum(dim=-1)  # [B,N]
+        logits_global = score_global / self.temp.clamp_min(1e-6)
+
+        loss_each = F.cross_entropy(logits_global, labels, reduction="none")
+        loss_itc = loss_each.mean()
+
+        return loss_itc, logits_global, score_global, entropy_q
 
 
-# ================= [主模型模块] =================
+# ================= [主模型] =================
 
 
 @registry.register_model("blip2_cir_align_prompt")
@@ -156,7 +252,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             vit_model, img_size, drop_path_rate, use_grad_checkpoint, vit_precision
         )
         if freeze_vit:
-            for name, param in self.visual_encoder.named_parameters():
+            for _, param in self.visual_encoder.named_parameters():
                 param.requires_grad = False
             self.visual_encoder = self.visual_encoder.eval()
             self.visual_encoder.train = disabled_train
@@ -175,42 +271,39 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
 
         self.vision_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
         self.text_proj = nn.Linear(self.Qformer.config.hidden_size, embed_dim)
+
         self.max_txt_len = max_txt_len
         self.embed_dim = embed_dim
 
         hidden_size = self.Qformer.config.hidden_size
         vision_width = self.visual_encoder.num_features
 
-        self.kappa_predictor = KappaPredictor(input_dim=hidden_size)
-        self.kappa_t_predictor = KappaPredictor(input_dim=hidden_size)
-        self.kappa_v_predictor = KappaPredictor(input_dim=hidden_size)
+        # kappa 分支
+        self.kappa_predictor = KappaPredictor(input_dim=hidden_size)      # query token
+        self.kappa_t_predictor = KappaPredictor(input_dim=hidden_size)    # text global
+        self.kappa_v_predictor = KappaPredictor(input_dim=hidden_size)    # image global
 
         nn.init.constant_(self.kappa_t_predictor.net[3].bias, 3.0)
         nn.init.constant_(self.kappa_v_predictor.net[3].bias, 3.0)
 
-        self.global_vmf_loss = Global_vMF_CIR_Loss(
+        # stabilized energy loss
+        self.token_vmf_loss = TokenWise_vMF_KL_CIR_Loss(
             feature_dim=embed_dim,
+            temp_init=0.07,
+            token_weight_temp=0.5,
         )
 
-        # 动态融合温度
         self.dynamic_fusion_tau = 0.5
 
-        # ===== 新 query：局部 token 选择 + 门控更新 =====
+        # ===== 局部 token 选择 + 门控更新 =====
         self.topk_tokens = 16
 
-        # 文本全局向量 -> 视觉 token 空间，用于对图像 token 打分
         self.text_to_vision = nn.Linear(hidden_size, vision_width)
-
-        # 局部视觉表示 -> hidden 空间，用于和文本做差异 r
         self.vision_to_hidden = nn.Linear(vision_width, hidden_size)
-
-        # 差异向量归一化
         self.r_ln = nn.LayerNorm(hidden_size)
 
-        # 预估“文本-局部”层面的局部不确定性
         self.local_kappa_predictor = KappaPredictor(input_dim=hidden_size * 3)
 
-        # 用 r + uncertainty 生成 gate g（标量门）
         self.gate_mlp = nn.Sequential(
             nn.Linear(hidden_size + 3, hidden_size),
             nn.GELU(),
@@ -218,7 +311,6 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             nn.Linear(hidden_size, 1)
         )
 
-        # 仅更新 top-k token 的更新网络
         self.update_mlp = nn.Sequential(
             nn.Linear(vision_width * 3, vision_width),
             nn.GELU(),
@@ -226,18 +318,28 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             nn.Linear(vision_width, vision_width)
         )
 
-    # ---------- helper: 动态融合 ----------
+        self.prompt_tokens = nn.Parameter(
+            torch.zeros(1, num_query_token, self.Qformer.config.hidden_size)
+        )
+        self.prompt_tokens.data.normal_(
+            mean=0.0, std=self.Qformer.config.initializer_range
+        )
+
+    # ---------- helper ----------
     def _dynamic_fuse_kappa(self, k_m, k_t, k_r, eps=1e-6):
+        """
+        这里只保留日志分析用途，不作为主损失输入
+        """
         u_m = 1.0 / (k_m + eps)
         u_t = 1.0 / (k_t + eps)
         u_r = 1.0 / (k_r + eps)
 
-        u_stack = torch.cat([u_r, u_t, u_m], dim=1)
-        weights = F.softmax(-u_stack / self.dynamic_fusion_tau, dim=1)
+        u_stack = torch.stack([u_r, u_t, u_m], dim=-1)  # [B, T, 3]
+        weights = F.softmax(-u_stack / self.dynamic_fusion_tau, dim=-1)
 
-        w_r = weights[:, 0:1]
-        w_t = weights[:, 1:2]
-        w_m = weights[:, 2:3]
+        w_r = weights[:, :, 0]
+        w_t = weights[:, :, 1]
+        w_m = weights[:, :, 2]
 
         u_q = w_r * u_r + w_t * u_t + w_m * u_m
         k_q = 1.0 / (u_q + eps)
@@ -260,16 +362,16 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         B, N, C = image_embeds.shape
         topk = min(self.topk_tokens, N)
 
-        # ===== 1) 文本编码 =====
+        # text global
         text_output = self.Qformer.bert(
             text_input_ids,
             attention_mask=text_attention_mask,
             return_dict=True
         )
         raw_text_emb = text_output.last_hidden_state[:, 0, :]
-        k_t = self.kappa_t_predictor(raw_text_emb)
+        k_t = self.kappa_t_predictor(raw_text_emb)  # [B,1]
 
-        # ===== 2) 参考图质量分支 =====
+        # image global
         query_image_output = self.Qformer.bert(
             query_embeds=query_tokens,
             encoder_hidden_states=image_embeds,
@@ -277,9 +379,9 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             return_dict=True
         )
         raw_vision_emb = query_image_output.last_hidden_state[:, 0, :]
-        k_r = self.kappa_v_predictor(raw_vision_emb)
+        k_r = self.kappa_v_predictor(raw_vision_emb)  # [B,1]
 
-        # ===== 3) 文本对图像 token 打分，选 top-k =====
+        # text-guided top-k selection
         text_vis = self.text_to_vision(raw_text_emb)
         token_scores = torch.bmm(
             image_embeds, text_vis.unsqueeze(-1)
@@ -289,11 +391,9 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         topk_attn = F.softmax(topk_scores, dim=1)
         selected_vis = self._batched_gather_tokens(image_embeds, topk_idx)
 
-        # ===== 4) 聚合得到局部视觉表示 f_local =====
         f_local = (selected_vis * topk_attn.unsqueeze(-1)).sum(dim=1)
         f_local_h = self.vision_to_hidden(f_local)
 
-        # ===== 5) 差异 r + uncertainty -> gate g =====
         r_vec = self.r_ln(raw_text_emb - f_local_h)
 
         local_k_input = torch.cat([raw_text_emb, f_local_h, r_vec], dim=-1)
@@ -308,7 +408,6 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
 
         g = torch.sigmoid(self.gate_mlp(gate_input))
 
-        # ===== 6) 只更新 top-k token =====
         text_vis_expand = text_vis.unsqueeze(1).expand(-1, topk, -1)
         f_local_expand = f_local.unsqueeze(1).expand(-1, topk, -1)
 
@@ -321,7 +420,6 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
         topk_idx_exp = topk_idx.unsqueeze(-1).expand(-1, -1, C)
         updated_image_embeds.scatter_(1, topk_idx_exp, updated_selected_vis)
 
-        # ===== 7) 用更新后的 token + 文本做 composer =====
         attention_mask = torch.cat([query_atts, text_attention_mask], dim=1)
 
         fusion_output = self.Qformer.bert(
@@ -340,8 +438,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             return_dict=True,
         )
 
-        # ===== 回归你原来的实现：直接取 full sequence 的 index=32 =====
-        raw_fusion_emb = second_pass_output.last_hidden_state[:, 32, :]
+        raw_fusion_tokens = second_pass_output.last_hidden_state[:, : query_tokens.size(1), :]
 
         aux = {
             "k_t": k_t,
@@ -355,25 +452,9 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             "updated_image_embeds": updated_image_embeds,
         }
 
-        return raw_text_emb, raw_fusion_emb, aux
+        return raw_text_emb, raw_fusion_tokens, aux, fusion_output
 
-    # ---------- helper: pairwise ranking uncertainty calibration ----------
-    def _pairwise_kappa_ranking_loss(self, kappa, margin, eps=1e-6):
-        log_kappa = torch.log(kappa.squeeze(-1) + eps)
-        margin_norm = (margin - margin.mean()) / (margin.std() + eps)
-
-        margin_diff = margin_norm.unsqueeze(1) - margin_norm.unsqueeze(0)
-        logk_diff = log_kappa.unsqueeze(1) - log_kappa.unsqueeze(0)
-
-        eye_mask = torch.eye(margin.size(0), device=margin.device, dtype=torch.bool)
-        valid_mask = (~eye_mask) & (margin_diff.abs() > 0.1)
-
-        if valid_mask.any():
-            pair_loss = F.softplus(-(margin_diff.detach() * logk_diff))
-            return pair_loss[valid_mask].mean()
-        else:
-            return torch.zeros([], device=margin.device, dtype=margin.dtype)
-
+    # ---------- forward ----------
     def forward(self, samples, enable_uncertainty=False):
         image = samples["image"]
         target = samples["target"]
@@ -387,6 +468,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
                 if image.dim() != 3 else self.ln_vision(image.to(model_dtype))
             )
             image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+
             query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
             query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(self.device)
 
@@ -404,8 +486,8 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             )
             target_atts = torch.ones(target_embeds.size()[:-1], dtype=torch.long).to(image.device)
 
-            # ===== query 构造：保持你的新逻辑 =====
-            raw_text_emb, raw_fusion_emb, query_aux = self._build_query_from_image_text(
+            # query branch
+            raw_text_emb, raw_fusion_tokens, query_aux, fusion_output = self._build_query_from_image_text(
                 image_embeds=image_embeds,
                 image_atts=image_atts,
                 query_tokens=query_tokens,
@@ -414,13 +496,13 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
                 text_attention_mask=text_tokens.attention_mask,
             )
 
-            k_t = query_aux["k_t"]
-            k_r = query_aux["k_r"]
+            k_t = query_aux["k_t"]          # [B,1]
+            k_r = query_aux["k_r"]          # [B,1]
             k_local = query_aux["k_local"]
             g = query_aux["g"]
             topk_attn = query_aux["topk_attn"]
 
-            # ===== target 改为 32 个 token 表示 =====
+            # target branch
             target_output = self.Qformer.bert(
                 query_embeds=query_tokens,
                 encoder_hidden_states=target_embeds,
@@ -428,42 +510,35 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
                 use_cache=True,
                 return_dict=True
             )
-            raw_target_emb = target_output.last_hidden_state[:, 0, :]
-            target_feats = F.normalize(self.vision_proj(target_output.last_hidden_state), dim=-1)
-            k_target = self.kappa_v_predictor(raw_target_emb)
 
-            # ===== 主方向特征 =====
-            u_query = F.normalize(self.text_proj(raw_fusion_emb), dim=-1)
+            target_feats = F.normalize(self.vision_proj(target_output.last_hidden_state), dim=-1)   # [B,32,D]
+            k_target_tokens = self.kappa_v_predictor(target_output.last_hidden_state).squeeze(-1)    # [B,32]
 
-            # ===== query uncertainty =====
-            k_query_raw = self.kappa_predictor(raw_fusion_emb)
+            # query tokens
+            u_query_tokens = F.normalize(self.text_proj(raw_fusion_tokens), dim=-1)   # [B,32,D]
+            k_query_tokens_raw = self.kappa_predictor(raw_fusion_tokens).squeeze(-1)   # [B,32]
 
+            # 仅用于日志，不进主 loss
             with torch.no_grad():
+                k_t_exp = k_t.expand(-1, u_query_tokens.size(1))
+                k_r_exp = k_r.expand(-1, u_query_tokens.size(1))
                 k_query_final, w_r, w_t, w_m = self._dynamic_fuse_kappa(
-                    k_query_raw.detach(), k_t.detach(), k_r.detach()
+                    k_query_tokens_raw.detach(), k_t_exp.detach(), k_r_exp.detach()
                 )
 
-            # ===== 主检索损失：InfoNCE + 轻量 hard negative =====
-            base_loss, sim_i2t, loss_info = self.global_vmf_loss(
-                fusion_feats=u_query,
-                kappa_q=k_query_raw,
-                target_feats=target_feats,
+            # ===== 主检索 loss =====
+            base_loss, logits_global, score_global, entropy_q = self.token_vmf_loss(
+                query_tokens=u_query_tokens,
+                kappa_q_tokens=k_query_tokens_raw,
+                target_tokens=target_feats,
+                kappa_t_tokens=k_target_tokens,
             )
 
-            # # ===== batch 内 margin，用于 uncertainty 校准 =====
-            # with torch.no_grad():
-            #     pos_sim = sim_i2t.diag()
-            #     eye_mask = torch.eye(sim_i2t.size(0), device=sim_i2t.device).bool()
-            #     hardest_neg = sim_i2t.masked_fill(eye_mask, -1e4).max(dim=1)[0]
-            #     margin = pos_sim - hardest_neg
-
-            # loss_kappa = self._pairwise_kappa_ranking_loss(k_query_raw, margin)
-
-            # ===== 错配文本分支：走同样的 query 构造流程 =====
+            # ===== wrong-text coordination =====
             wrong_text_ids = torch.roll(text_tokens.input_ids, shifts=1, dims=0)
             wrong_text_mask = torch.roll(text_tokens.attention_mask, shifts=1, dims=0)
 
-            _, raw_wrong_fusion_emb, _ = self._build_query_from_image_text(
+            _, raw_wrong_fusion_tokens, _, _ = self._build_query_from_image_text(
                 image_embeds=image_embeds,
                 image_atts=image_atts,
                 query_tokens=query_tokens,
@@ -472,54 +547,66 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
                 text_attention_mask=wrong_text_mask,
             )
 
-            kappa_m_wrong = self.kappa_predictor(raw_wrong_fusion_emb)
+            kappa_m_wrong = self.kappa_predictor(raw_wrong_fusion_tokens).squeeze(-1)
+            loss_cord = F.softplus(-(k_query_tokens_raw - kappa_m_wrong)).mean()
 
-            # 正确图文组合应比错配更确定
-            loss_cord = F.softplus(-(k_query_raw - kappa_m_wrong)).mean()
+            # ===== text-only branch (rtc) =====
+            prompt_tokens = self.prompt_tokens.expand(image_embeds.shape[0], -1, -1)
+            attention_mask = torch.cat([query_atts, text_tokens.attention_mask], dim=1)
+
+            text_only_output = self.Qformer.bert(
+                text_tokens.input_ids,
+                query_embeds=prompt_tokens,
+                attention_mask=attention_mask,
+                return_dict=True,
+                no_img=True
+            )
+
+            raw_text_only_tokens = text_only_output.last_hidden_state[:, : query_tokens.size(1), :]
+            u_text_only_tokens = F.normalize(self.text_proj(raw_text_only_tokens), dim=-1)
+            k_text_only = self.kappa_predictor(raw_text_only_tokens).squeeze(-1)
+
+            loss_rtc, _, _, _ = self.token_vmf_loss(
+                query_tokens=u_text_only_tokens,
+                kappa_q_tokens=k_text_only,
+                target_tokens=target_feats,
+                kappa_t_tokens=k_target_tokens,
+            )
+
+            # ===== prompt-anchor align =====
+            loss_align = F.mse_loss(
+                fusion_output.last_hidden_state[:, : query_tokens.size(1), :],
+                prompt_tokens.detach()
+            )
 
             # ===== 总损失 =====
-            total_loss = base_loss  + 0.05 * loss_cord
+            # rtc / align 权重调轻
+            total_loss = base_loss + 0.05 * loss_cord + 0.20 * loss_rtc + 0.10 * loss_align
 
         return {
             'loss': total_loss,
             'loss_base': base_loss.item(),
-            # 'loss_kappa': loss_kappa.item(),
             'loss_cord': loss_cord.item(),
+            'loss_align': loss_align.item(),
+            'loss_rtc': loss_rtc.item(),
 
-            # 兼容旧日志接口，置零即可
+            # 兼容旧字段
             'loss_nll_q': 0.0,
             'loss_nll_t': 0.0,
             'loss_rank': 0.0,
 
-            # ===== kappa 统计 =====
-            'k_q_raw_std': k_query_raw.std().item(),
-            'k_q_raw_min': k_query_raw.min().item(),
-            'k_q_raw_max': k_query_raw.max().item(),
+            'k_q_raw_mean': k_query_tokens_raw.mean().item(),
+            'k_q_raw_std': k_query_tokens_raw.std().item(),
+            'k_q_raw_min': k_query_tokens_raw.min().item(),
+            'k_q_raw_max': k_query_tokens_raw.max().item(),
 
             'k_q_final_mean': k_query_final.mean().item(),
-            'k_q_final_std': k_query_final.std().item(),
-            'k_q_final_min': k_query_final.min().item(),
-            'k_q_final_max': k_query_final.max().item(),
-
             'k_t_std': k_t.std().item(),
-            'k_t_min': k_t.min().item(),
-            'k_t_max': k_t.max().item(),
-
-            # 兼容原日志名字，k_v 实际上这里代表 reference-image quality 分支
             'k_v_std': k_r.std().item(),
-            'k_v_min': k_r.min().item(),
-            'k_v_max': k_r.max().item(),
 
-            # ===== 动态融合权重统计 =====
             'w_r_mean': w_r.mean().item(),
             'w_t_mean': w_t.mean().item(),
             'w_m_mean': w_m.mean().item(),
-
-            # # ===== 难度统计 =====
-            # 'margin_mean': margin.mean().item(),
-            # 'margin_std': margin.std().item(),
-            # 'pos_sim_mean': pos_sim.mean().item(),
-            # 'hardest_neg_mean': hardest_neg.mean().item(),
 
             'k_q_wrong_mean': kappa_m_wrong.mean().item(),
             'k_local_mean': k_local.mean().item(),
@@ -529,9 +616,6 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
 
     @torch.no_grad()
     def forward_debug(self, samples):
-        """
-        训练 batch 级分析：margin 按 target 多 token 后的 sim_i2t 计算
-        """
         image = samples["image"]
         target = samples["target"]
         text = samples["text_input"]
@@ -544,6 +628,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
                 if image.dim() != 3 else self.ln_vision(image.to(model_dtype))
             )
             image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+
             query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
             query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(self.device)
 
@@ -561,7 +646,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             )
             target_atts = torch.ones(target_embeds.size()[:-1], dtype=torch.long).to(image.device)
 
-            _, raw_fusion_emb, query_aux = self._build_query_from_image_text(
+            _, raw_fusion_tokens, query_aux, _ = self._build_query_from_image_text(
                 image_embeds=image_embeds,
                 image_atts=image_atts,
                 query_tokens=query_tokens,
@@ -581,24 +666,55 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
                 return_dict=True
             )
             target_feats = F.normalize(self.vision_proj(target_output.last_hidden_state), dim=-1)
+            k_target_tokens = self.kappa_v_predictor(target_output.last_hidden_state).squeeze(-1)
 
-            u_query = F.normalize(self.text_proj(raw_fusion_emb), dim=-1)
+            u_query_tokens = F.normalize(self.text_proj(raw_fusion_tokens), dim=-1)
+            k_query_tokens_raw = self.kappa_predictor(raw_fusion_tokens).squeeze(-1)
 
-            k_query_raw = self.kappa_predictor(raw_fusion_emb)
-            k_query_final, _, _, _ = self._dynamic_fuse_kappa(k_query_raw, k_t, k_r)
+            k_t_exp = k_t.expand(-1, u_query_tokens.size(1))
+            k_r_exp = k_r.expand(-1, u_query_tokens.size(1))
+            k_query_final, _, _, _ = self._dynamic_fuse_kappa(k_query_tokens_raw, k_t_exp, k_r_exp)
 
-            sim_q2t_tokens = torch.einsum('bd,ntd->bnt', u_query, target_feats)
-            sim_i2t, _ = sim_q2t_tokens.max(dim=-1)
+            # 与训练一致的分数
+            # target token-wise kappa
+            k_target_tokens = self.kappa_v_predictor(target_output.last_hidden_state).squeeze(-1)   # [B,32]
 
+            # cosine between token pairs
+            sim_q2t = torch.einsum('bqd,ntd->bntq', u_query_tokens, target_feats)   # [B,N,T_t,T_q]
+
+            kq = k_query_tokens_raw.clamp_min(1e-6).unsqueeze(1).unsqueeze(1)   # [B,1,1,T_q]
+            kt = k_target_tokens.clamp_min(1e-6).unsqueeze(0).unsqueeze(-1)     # [1,N,T_t,1]
+
+            kl_q_t = vmf_kl(
+                kappa_p=kq,
+                mu_dot=sim_q2t,
+                kappa_q=kt,
+                d=self.embed_dim
+            )
+            kl_t_q = vmf_kl(
+                kappa_p=kt,
+                mu_dot=sim_q2t,
+                kappa_q=kq,
+                d=self.embed_dim
+            )
+
+            skl_qt = 0.5 * (kl_q_t + kl_t_q)
+            score_q2t = -skl_qt
+
+            max_score_i2t, _ = score_q2t.max(dim=2)   # [B,N,T_q]
+
+            entropy_q = vmf_entropy(k_query_tokens_raw, self.embed_dim)   # [B,T_q]
+            token_weights = F.softmax(-entropy_q / 0.5, dim=-1)
+            sim_i2t = (max_score_i2t * token_weights.unsqueeze(1)).sum(dim=-1)
             pos_sim = sim_i2t.diag()
             eye_mask = torch.eye(sim_i2t.size(0), device=sim_i2t.device).bool()
             hardest_neg = sim_i2t.masked_fill(eye_mask, -1e4).max(dim=1)[0]
             margin = pos_sim - hardest_neg
 
         return {
-            "query_feat": u_query,
-            "k_q_raw": k_query_raw.squeeze(-1).float().cpu(),
-            "k_q_final": k_query_final.squeeze(-1).float().cpu(),
+            "query_feat": u_query_tokens,
+            "k_q_raw": k_query_tokens_raw.mean(dim=-1).float().cpu(),
+            "k_q_final": k_query_final.mean(dim=-1).float().cpu(),
             "k_t": k_t.squeeze(-1).float().cpu(),
             "k_v": k_r.squeeze(-1).float().cpu(),
             "margin": margin.float().cpu(),
@@ -611,11 +727,13 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
 
         with self.maybe_autocast():
             model_dtype = self.visual_encoder.patch_embed.proj.weight.dtype
+
             image_embeds = (
                 self.ln_vision(self.visual_encoder(image.to(model_dtype)))
                 if image.dim() != 3 else self.ln_vision(image.to(model_dtype))
             )
             image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+
             query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
             query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(self.device)
 
@@ -627,7 +745,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
                 return_tensors="pt"
             ).to(image.device)
 
-            _, raw_fusion_emb, query_aux = self._build_query_from_image_text(
+            _, raw_fusion_tokens, _, _ = self._build_query_from_image_text(
                 image_embeds=image_embeds,
                 image_atts=image_atts,
                 query_tokens=query_tokens,
@@ -636,9 +754,10 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
                 text_attention_mask=text_tokens.attention_mask,
             )
 
-            u_query = F.normalize(self.text_proj(raw_fusion_emb), dim=-1)
-            k_query_raw = self.kappa_predictor(raw_fusion_emb)
-            return u_query, k_query_raw
+            u_query_tokens = F.normalize(self.text_proj(raw_fusion_tokens), dim=-1)
+            k_query_tokens_raw = self.kappa_predictor(raw_fusion_tokens).squeeze(-1)
+
+            return u_query_tokens, k_query_tokens_raw
 
     @torch.no_grad()
     def extract_query_debug_features(self, image, text):
@@ -647,11 +766,13 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
 
         with self.maybe_autocast():
             model_dtype = self.visual_encoder.patch_embed.proj.weight.dtype
+
             image_embeds = (
                 self.ln_vision(self.visual_encoder(image.to(model_dtype)))
                 if image.dim() != 3 else self.ln_vision(image.to(model_dtype))
             )
             image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(image.device)
+
             query_tokens = self.query_tokens.expand(image_embeds.shape[0], -1, -1)
             query_atts = torch.ones(query_tokens.size()[:-1], dtype=torch.long).to(self.device)
 
@@ -663,7 +784,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
                 return_tensors="pt"
             ).to(image.device)
 
-            _, raw_fusion_emb, query_aux = self._build_query_from_image_text(
+            _, raw_fusion_tokens, query_aux, _ = self._build_query_from_image_text(
                 image_embeds=image_embeds,
                 image_atts=image_atts,
                 query_tokens=query_tokens,
@@ -675,14 +796,17 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
             k_t = query_aux["k_t"]
             k_r = query_aux["k_r"]
 
-            u_query = F.normalize(self.text_proj(raw_fusion_emb), dim=-1)
-            k_q_raw = self.kappa_predictor(raw_fusion_emb)
-            k_q_final, _, _, _ = self._dynamic_fuse_kappa(k_q_raw, k_t, k_r)
+            u_query_tokens = F.normalize(self.text_proj(raw_fusion_tokens), dim=-1)
+            k_q_raw = self.kappa_predictor(raw_fusion_tokens).squeeze(-1)
+
+            k_t_exp = k_t.expand(-1, u_query_tokens.size(1))
+            k_r_exp = k_r.expand(-1, u_query_tokens.size(1))
+            k_q_final, _, _, _ = self._dynamic_fuse_kappa(k_q_raw, k_t_exp, k_r_exp)
 
         return {
-            "query_feat": u_query,
-            "k_q_raw": k_q_raw.squeeze(-1),
-            "k_q_final": k_q_final.squeeze(-1),
+            "query_feat": u_query_tokens,
+            "k_q_raw": k_q_raw.mean(dim=-1),
+            "k_q_final": k_q_final.mean(dim=-1),
             "k_t": k_t.squeeze(-1),
             "k_v": k_r.squeeze(-1),
         }
@@ -696,6 +820,7 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
                 if image.dim() != 3 else self.ln_vision(image.to(model_dtype))
             )
             image_atts = torch.ones(image_embeds_frozen.size()[:-1], dtype=torch.long).to(self.device)
+
             query_tokens = self.query_tokens.expand(image_embeds_frozen.shape[0], -1, -1)
 
             query_output = self.Qformer.bert(
@@ -704,25 +829,51 @@ class Blip2QformerCirAlignPrompt(Blip2Base):
                 encoder_attention_mask=image_atts,
                 return_dict=True
             )
-            raw_target_emb = query_output.last_hidden_state[:, 0, :]
+
             target_features = F.normalize(self.vision_proj(query_output.last_hidden_state), dim=-1)
+            k_target_tokens = self.kappa_v_predictor(query_output.last_hidden_state).squeeze(-1)
 
-            k_target = self.kappa_v_predictor(raw_target_emb)
-
-        return target_features, k_target
+        return target_features, k_target_tokens
 
     @torch.no_grad()
     def inference(self, query_feat, k_query, target_feats, k_targets):
-        if target_feats.dim() == 2:
-            similarity_scores = torch.matmul(query_feat, target_feats.t())
+        """
+        Query 和 Target 均为序列表示
+        - token-pair 度量：对称 KL
+        - target token 维：MaxSim (最大负 KL)
+        - query token 聚合：熵加权
+        """
+        sim_q2t = torch.einsum('bqd,ntd->bntq', query_feat, target_feats)   # [B,N,T_t,T_q]
 
-        elif target_feats.dim() == 3:
-            sim_q2t_tokens = torch.einsum('bd,ntd->bnt', query_feat, target_feats)
-            similarity_scores, _ = sim_q2t_tokens.max(dim=-1)
+        if k_query is None or k_targets is None:
+            max_sim_i2t, _ = sim_q2t.max(dim=2)
+            return max_sim_i2t.mean(dim=-1)
 
-        else:
-            raise ValueError(f"Unrecognized target_feats dimension: {target_feats.dim()}")
+        kq = k_query.clamp_min(1e-6).unsqueeze(1).unsqueeze(1)   # [B,1,1,T_q]
+        kt = k_targets.clamp_min(1e-6).unsqueeze(0).unsqueeze(-1)  # [1,N,T_t,1]
 
+        kl_q_t = vmf_kl(
+            kappa_p=kq,
+            mu_dot=sim_q2t,
+            kappa_q=kt,
+            d=self.embed_dim
+        )
+        kl_t_q = vmf_kl(
+            kappa_p=kt,
+            mu_dot=sim_q2t,
+            kappa_q=kq,
+            d=self.embed_dim
+        )
+
+        skl_qt = 0.5 * (kl_q_t + kl_t_q)
+        score_q2t = -skl_qt
+
+        max_score_i2t, _ = score_q2t.max(dim=2)   # [B,N,T_q]
+
+        entropy_q = vmf_entropy(k_query, self.embed_dim)   # [B,T_q]
+        token_weights = F.softmax(-entropy_q / 0.5, dim=-1)
+
+        similarity_scores = (max_score_i2t * token_weights.unsqueeze(1)).sum(dim=-1)
         return similarity_scores
 
     @classmethod
