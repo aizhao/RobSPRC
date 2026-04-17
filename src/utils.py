@@ -31,7 +31,7 @@ def extract_index_blip_features(dataset: Union[CIRRDataset, FashionIQDataset], b
     feature_dim = 256  # 默认投影维度，根据实际情况可能调整
     
     # 使用 classic 模式的 DataLoader，batch_size 可以适当大一点
-    classic_val_loader = DataLoader(dataset=dataset, batch_size=64, num_workers=8,
+    classic_val_loader = DataLoader(dataset=dataset, batch_size=128, num_workers=8,
                                     pin_memory=True, collate_fn=collate_fn, shuffle=False)
     
     index_features = []

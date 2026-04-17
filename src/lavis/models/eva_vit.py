@@ -439,7 +439,7 @@ def create_eva_vit_g(img_size=224,drop_path_rate=0.4,use_checkpoint=False,precis
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
         use_checkpoint=use_checkpoint,
     )  
-    url = "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/models/BLIP2/eva_vit_g.pth"
+    url = "https://cas-bridge.xethub.hf.co/xet-bridge-us/650ab7b8ad753305def47e78/6033f87ee62db7e7e68610e20057b96d3bf245bacaa44685bc67bb6eea9a49ec?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD&X-Amz-Credential=cas%2F20260416%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260416T054412Z&X-Amz-Expires=3600&X-Amz-Signature=78d9d142ce6b19e29576c39b74ee0d9caa52c695ac9fbae816e223779bacf973&X-Amz-SignedHeaders=host&X-Xet-Cas-Uid=62171e3b6a99db28e0b3159d&response-content-disposition=attachment%3B+filename*%3DUTF-8%27%27eva_vit_g.pth%3B+filename%3D%22eva_vit_g.pth%22%3B&x-amz-checksum-mode=ENABLED&x-id=GetObject&Expires=1776321852&Policy=eyJTdGF0ZW1lbnQiOlt7IkNvbmRpdGlvbiI6eyJEYXRlTGVzc1RoYW4iOnsiQVdTOkVwb2NoVGltZSI6MTc3NjMyMTg1Mn19LCJSZXNvdXJjZSI6Imh0dHBzOi8vY2FzLWJyaWRnZS54ZXRodWIuaGYuY28veGV0LWJyaWRnZS11cy82NTBhYjdiOGFkNzUzMzA1ZGVmNDdlNzgvNjAzM2Y4N2VlNjJkYjdlN2U2ODYxMGUyMDA1N2I5NmQzYmYyNDViYWNhYTQ0Njg1YmM2N2JiNmVlYTlhNDllYyoifV19&Signature=js5z-MPhfDQOTqReOoSD-asbTMDRfzD3NjuqvrS0f1ry9Cqg-b5YeW%7Ez02gyTNZ-aBtlbFa4xvJe5F2X5FzBr7PzkLGrhTlaGuSNrO%7EfeGkd9dL77-jxw7%7EIaHoV1sBh-slT2lIGuvyseaCtXvG64EMzWTBqAe%7Eh-t8NwmVDMHZojJdHgIcXed9xGr8qk6wYhUPAO-BE7%7EqQPRnR7EF75XcrH8QZcZ2O6W-8zJ5dLnTsRRYrHLKkDfARva9jgxjm2Sz-9eBJBIy-F-wukbEQ4tC9QlmYhCBI9hgykDYbaLA9-M34yW11F5j9tJk%7EFog8bnz4wRPZmS-ob0eImqEmEw__&Key-Pair-Id=K2L8F4GPSG1IFC"
     cached_file = download_cached_file(
         url, check_hash=False, progress=True
     )

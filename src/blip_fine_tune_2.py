@@ -331,7 +331,7 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
 
     optimizer = optim.AdamW([
         {'params': backbone_params, 'lr': learning_rate, 'betas': (0.9, 0.98), 'eps': 1e-8, 'weight_decay': 0.05},
-        {'params': loss_params, 'lr': 1e-3, 'betas': (0.9, 0.98), 'eps': 1e-8, 'weight_decay': 0.0} # 🌟 Sigmoid 边界专属法拉利起步
+        {'params': loss_params, 'lr': 1e-5, 'betas': (0.9, 0.98), 'eps': 1e-8, 'weight_decay': 0.0} # 🌟 Sigmoid 边界专属法拉利起步
     ])
     
     # 🌟 修复 OneCycleLR 多组参数覆盖问题：必须传入一个对应长度的 list
@@ -426,22 +426,22 @@ def clip_finetune_cirr(num_epochs: int, blip_model_name: str, backbone: str, lea
             }
 
             # 2) 新增：kappa 行为分析
-            kappa_analysis = analyze_cirr_kappa_behavior(
-                blip_model=blip_model,
-                relative_val_dataset=relative_val_dataset,
-                index_names=val_index_names,
-                index_features=val_index_features,
-                txt_processors=txt_processors,
-                val_index_kappas=val_index_kappas,
-            )
+            # kappa_analysis = analyze_cirr_kappa_behavior(
+            #     blip_model=blip_model,
+            #     relative_val_dataset=relative_val_dataset,
+            #     index_names=val_index_names,
+            #     index_features=val_index_features,
+            #     txt_processors=txt_processors,
+            #     val_index_kappas=val_index_kappas,
+            # )
 
             print(json.dumps(results_dict, indent=4, ensure_ascii=False))
-            print(json.dumps(kappa_analysis, indent=4, ensure_ascii=False))
+            # print(json.dumps(kappa_analysis, indent=4, ensure_ascii=False))
 
             # 3) 一起写入日志
             log_dict = {'epoch': epoch}
             log_dict.update(results_dict)
-            log_dict.update(kappa_analysis)
+            # log_dict.update(kappa_analysis)
 
             validation_log_frame = pd.concat(
                 [validation_log_frame, pd.DataFrame(data=log_dict, index=[0])]

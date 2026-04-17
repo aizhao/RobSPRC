@@ -243,14 +243,17 @@ def analyze_cirr_kappa_behavior(blip_model, relative_val_dataset: CIRRDataset,
 
                 query_feat = debug_out["query_feat"]              # [B, D]
                 k_q_raw = debug_out["k_q_raw"]                    # [B]
-                k_q_final = debug_out["k_q_final"]                # [B]
+                # k_q_final = debug_out["k_q_final"]              # [B]
+                k_q_final_mean = debug_out["k_q_final_mean"]
+                k_q_final_tokens = debug_out["k_q_final_tokens"]
                 k_t = debug_out["k_t"]                            # [B]
                 k_v = debug_out["k_v"]                            # [B]
 
                 # 用当前 inference（纯 cosine）算整库相似度
+                # 修改 validate_blip.py 第 254 行附近：
                 sims = blip_model.inference(
                     query_feat=query_feat,
-                    k_query=None,
+                    k_query=k_q_final_tokens, 
                     target_feats=gallery_features,
                     k_targets=val_index_kappas.to(device) if val_index_kappas is not None else None
                 )  # [B, N]
@@ -272,7 +275,7 @@ def analyze_cirr_kappa_behavior(blip_model, relative_val_dataset: CIRRDataset,
                 margin = pos_sim - hardest_neg  # [B]
 
                 all_kq_raw.append(k_q_raw.float().cpu().numpy())
-                all_kq_final.append(k_q_final.float().cpu().numpy())
+                all_kq_final.append(k_q_final_mean.float().cpu().numpy()) 
                 all_kt.append(k_t.float().cpu().numpy())
                 all_kv.append(k_v.float().cpu().numpy())
                 all_margin.append(margin.float().cpu().numpy())
